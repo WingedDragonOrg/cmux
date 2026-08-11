@@ -1,0 +1,105 @@
+name: Build patched macOS DMG
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DERIVED_DATA: build-patched
+  SOURCE_PACKAGES: .spm-cache
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+
+      - name: Select Xcode
+        run: ./scripts/select-ci-xcode.sh
+
+      - name: Download pre-built GhosttyKit
+        run: ./scripts/download-prebuilt-ghosttykit.sh
+
+      - name: Install Rust
+        run: ./scripts/install-rust-ci.sh
+
+      - name: Build focused layout regression
+        run: |
+          set -euo pipefail
+          CMUX_SKIP_ZIG_BUILD=1 xcodebuild \
+            -project cmux.xcodeproj \
+            -scheme cmux-unit \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            -derivedDataPath build-tests \
+            -clonedSourcePackagesDirPath "$SOURCE_PACKAGES" \
+            -only-testing:cmuxTests/SidebarWorkspaceSwitchLayoutFaultTests \
+            CODE_SIGNING_ALLOWED=NO \
+            test
+
+      - name: Build arm64 Release app
+        run: |
+          set -euo pipefail
+          CMUX_SKIP_ZIG_BUILD=1 xcodebuild \
+            -project cmux.xcodeproj \
+            -scheme cmux \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath "$DERIVED_DATA" \
+            -clonedSourcePackagesDirPath "$SOURCE_PACKAGES" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Ad-hoc sign app
+        run: |
+          set -euo pipefail
+          APP="$DERIVED_DATA/Build/Products/Release/cmux.app"
+          ./scripts/strip-release-bundle.sh "$APP"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+      - name: Smoke-test bundle
+        run: |
+          set -euo pipefail
+          APP="$DERIVED_DATA/Build/Products/Release/cmux.app"
+          test -x "$APP/Contents/MacOS/cmux"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")" = "com.cmuxterm.app"
+          lipo -verify_arch arm64 "$APP/Contents/MacOS/cmux"
+          CMUX_SMOKE_ALLOW_UNSUPPORTED_GUI=1 CMUX_SMOKE_DEBUG_LOGS=1 ./scripts/smoke-launch-macos-app.sh "$APP"
+
+      - name: Package DMG
+        run: |
+          set -euo pipefail
+          APP="$DERIVED_DATA/Build/Products/Release/cmux.app"
+          STAGE="$RUNNER_TEMP/cmux-dmg"
+          rm -rf "$STAGE" cmux-patched-arm64.dmg
+          mkdir -p "$STAGE"
+          ditto "$APP" "$STAGE/cmux.app"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create \
+            -volname 'cmux patched' \
+            -srcfolder "$STAGE" \
+            -ov \
+            -format UDZO \
+            cmux-patched-arm64.dmg
+          hdiutil verify cmux-patched-arm64.dmg
+          shasum -a 256 cmux-patched-arm64.dmg > cmux-patched-arm64.dmg.sha256
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cmux-patched-arm64-dmg
+          path: |
+            cmux-patched-arm64.dmg
+            cmux-patched-arm64.dmg.sha256
+          if-no-files-found: error
+          retention-days: 14
